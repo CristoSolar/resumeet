@@ -1,0 +1,37 @@
+#!/usr/bin/env python3
+"""Intercala dos transcripciones de whisper-cli en una linea temporal etiquetada."""
+import json
+import sys
+
+
+def load(path, speaker):
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    out = []
+    for seg in data.get("transcription", []):
+        text = seg.get("text", "").strip()
+        if not text:
+            continue
+        out.append((seg["offsets"]["from"], speaker, text))
+    return out
+
+
+def stamp(ms):
+    total = ms // 1000
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
+def main():
+    if len(sys.argv) != 3:
+        sys.exit("uso: meet-merge <mic.json> <remoto.json>")
+    # Ellos=0 antes que Yo=1 al empatar: lo normal es responder a algo dicho.
+    segments = load(sys.argv[1], "Yo") + load(sys.argv[2], "Ellos")
+    segments.sort(key=lambda s: (s[0], s[1] == "Yo"))
+    if not segments:
+        sys.exit("transcripcion vacia")
+    for offset, speaker, text in segments:
+        print(f"[{stamp(offset)}] **{speaker}:** {text}")
+
+
+if __name__ == "__main__":
+    main()

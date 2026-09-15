@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# resumeet: graba una reunion (mic + audio del sistema en pistas separadas),
+# la transcribe con whisper.cpp y corre agentes (prompts .md) sobre la transcripcion.
+# Sin argumentos alterna grabar/parar. Ver --help.
+set -uo pipefail
+
+BASE="${MEET_REC_DIR:-$HOME/Reuniones}"
+AGENTS_DIR="${RESUMEET_AGENTS:-${XDG_CONFIG_HOME:-$HOME/.config}/resumeet/agents}"
+LLM="${RESUMEET_LLM:-claude -p}"   # comando que lee prompt como argumento y transcripcion por stdin
+LANG_STT="${RESUMEET_LANG:-es}"
+MODEL="${MEET_REC_MODEL:-$HOME/.local/share/whisper-models/ggml-large-v3-turbo.bin}"
+STATE="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/meet-rec.state"
+MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin"
+VAD_MODEL="${MEET_REC_VAD_MODEL:-$HOME/.local/share/whisper-models/ggml-silero-v5.1.2.bin}"
+VAD_URL="https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin"
+
+notify() { notify-send -a "meet-rec" "$1" "${2:-}"; }
+die() { echo "meet-rec: $1" >&2; notify "Error" "$1"; exit 1; }
+
+# El binario cambio de nombre entre versiones de whisper.cpp (main -> whisper-cli).
+whisper_bin() {
+  for candidate in whisper-cli whisper-cpp main; do
+    command -v "$candidate" >/dev/null 2>&1 && { echo "$candidate"; return 0; }
+  done
+  return 1
+}
+
+ensure_model() {
+  [[ -f "$MODEL" ]] && return 0
+  notify "Descargando modelo" "1.6 GB, solo la primera vez"
+  mkdir -p "$(dirname "$MODEL")"
+  curl -fL --retry 3 -o "$MODEL.part" "$MODEL_URL" || die "no se pudo descargar el modelo"
+  mv "$MODEL.part" "$MODEL"
+}
+
+ensure_vad_model() {
+  [[ -f "$VAD_MODEL" ]] && return 0
+  mkdir -p "$(dirname "$VAD_MODEL")"
+  curl -fL --retry 3 -o "$VAD_MODEL.part" "$VAD_URL" || die "no se pudo descargar el modelo VAD"
+  mv "$VAD_MODEL.part" "$VAD_MODEL"
+}
+
+start() {
+  command -v ffmpeg >/dev/null || die "falta ffmpeg"
+  local mic monitor dir
+  mic=$(pactl get-default-source) || die "no se pudo leer la fuente por defecto"
+  monitor="$(pactl get-default-sink).monitor" || die "no se pudo leer el sink por defecto"
+  dir="$BASE/$(date +%Y-%m-%d_%H%M)"
+  mkdir -p "$dir" || die "no se pudo crear $dir"
+
+  ffmpeg -nostdin -loglevel error -y \
+    -f pulse -i "$mic" \
+    -f pulse -i "$monitor" \
+    -map 0:a -ac 1 -ar 16000 -c:a pcm_s16le "$dir/mic.wav" \
+    -map 1:a -ac 1 -ar 16000 -c:a pcm_s16le "$dir/remoto.wav" \
+    >"$dir/ffmpeg.log" 2>&1 &
+  local pid=$!
+
+  sleep 1
+  kill -0 "$pid" 2>/dev/null || die "ffmpeg no arranco: $(tail -1 "$dir/ffmpeg.log")"
+  printf '%s\n%s\n' "$pid" "$dir" >"$STATE"
+  notify "Grabando" "$(basename "$dir")"
+}
+
+# SIGINT y no SIGKILL: ffmpeg necesita escribir el header final o el WAV queda corrupto.
+stop_ffmpeg() {
+  local pid=$1
+  kill -INT "$pid" 2>/dev/null
+  for _ in $(seq 20); do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.5
+  done
+  kill -KILL "$pid" 2>/dev/null
+  echo "meet-rec: ffmpeg no cerro limpio, el WAV puede estar truncado" >&2
+}
+
+transcribe() {
+  local dir=$1 bin
+  bin=$(whisper_bin) || die "falta whisper.cpp (pacman -S whisper-cpp)"
+  ensure_model
+  ensure_vad_model
+  # VAD recorta el silencio antes de transcribir. Sin esto whisper alucina
+  # frases de entrenamiento sobre los tramos mudos, que son la mayoria de
+  # cada pista (mientras habla uno, la otra esta en silencio).
+  for track in mic remoto; do
+    "$bin" -m "$MODEL" -l "$LANG_STT" -sns --vad -vm "$VAD_MODEL" \
+      -oj -of "$dir/$track" "$dir/$track.wav" \
+      >>"$dir/whisper.log" 2>&1
+    [[ $? -eq 0 ]] || return 1
+  done
+}
+
+# Agentes: cada archivo de $AGENTS_DIR/<nombre>.md es un prompt. Recibe la
+# transcripcion por stdin y escribe <nombre>.md en el directorio de la reunion.
+# Cada usuario agrega los suyos ahi; los que trae el repo se instalan con install.sh.
+run_agents() {
+  local dir=$1 agent name ok=0
+  shopt -s nullglob
+  local agents=("$AGENTS_DIR"/*.md)
+  shopt -u nullglob
+  [[ ${#agents[@]} -gt 0 ]] || { notify "Sin agentes" "agrega prompts .md en $AGENTS_DIR"; return 1; }
+  for agent in "${agents[@]}"; do
+    name=$(basename "$agent" .md)
+    if $LLM "$(cat "$agent")" <"$dir/transcripcion.md" >"$dir/$name.md"; then
+      ok=1
+    else
+      rm -f "$dir/$name.md"
+      notify "Fallo el agente $name" "transcripcion lista en $dir"
+    fi
+  done
+  [[ $ok -eq 1 ]]
+}
+
+# Corre desacoplado del toggle: el usuario recupera la terminal enseguida.
+process() {
+  local dir=$1
+  notify "Procesando" "transcribiendo..."
+  if ! transcribe "$dir"; then
+    notify "Fallo la transcripcion" "audio intacto en $dir"
+    exit 1
+  fi
+  if ! meet-merge "$dir/mic.json" "$dir/remoto.json" >"$dir/transcripcion.md"; then
+    notify "Fallo el intercalado" "JSON de whisper en $dir"
+    exit 1
+  fi
+  run_agents "$dir" || exit 1
+  notify "Reunion lista" "$dir"
+}
+
+stop() {
+  local pid dir
+  { read -r pid; read -r dir; } <"$STATE"
+  rm -f "$STATE"
+  stop_ffmpeg "$pid"
+  setsid "$0" --process "$dir" >/dev/null 2>&1 &
+  ask_title "$dir"
+}
+
+# Corre despues de lanzar el procesado: el titulo no bloquea la transcripcion.
+ask_title() {
+  local dir=$1 titulo
+  command -v zenity >/dev/null || return 0
+  titulo=$(zenity --entry --title="Resumeet" \
+    --text="Nombre de la reunion (vacio = solo fecha):" 2>/dev/null)
+  [[ -n "$titulo" ]] && printf '%s\n' "$titulo" >"$dir/titulo.txt"
+}
+
+self_test() {
+  local dir="${TMPDIR:-/tmp}/meet-rec-selftest-$$"
+  mkdir -p "$dir"
+  # Comillas dobles: la ruta se expande al armar el trap, no al dispararlo.
+  # $dir es local y ya no existe cuando el trap corre al salir.
+  trap "rm -rf '$dir'" EXIT
+  echo "Hablá al micrófono durante 4 segundos, ahora."
+  # -t va en cada salida, no antes del primer -i: ahi limita solo al input 0
+  # y ffmpeg queda esperando al segundo para siempre.
+  ffmpeg -nostdin -loglevel error -y \
+    -f pulse -i "$(pactl get-default-source)" \
+    -f pulse -i "$(pactl get-default-sink).monitor" \
+    -map 0:a -ac 1 -ar 16000 -c:a pcm_s16le -t 4 "$dir/mic.wav" \
+    -map 1:a -ac 1 -ar 16000 -c:a pcm_s16le -t 4 "$dir/remoto.wav" || { echo "FALLO: captura"; exit 1; }
+  [[ -s "$dir/mic.wav" && -s "$dir/remoto.wav" ]] || { echo "FALLO: pistas vacias"; exit 1; }
+  transcribe "$dir" || { echo "FALLO: whisper"; exit 1; }
+  meet-merge "$dir/mic.json" "$dir/remoto.json" >"$dir/transcripcion.md" || { echo "FALLO: intercalado"; exit 1; }
+  [[ -s "$dir/transcripcion.md" ]] || { echo "FALLO: transcripcion vacia"; exit 1; }
+  echo "OK - pipeline completo:"
+  cat "$dir/transcripcion.md"
+}
+
+case "${1:-toggle}" in
+  --process) process "$2" ;;
+  --self-test) self_test ;;
+  --status)
+    if [[ -f "$STATE" ]]; then head -2 "$STATE" | tr '\n' ' '; echo; else echo "detenido"; fi ;;
+  --help|-h)
+    echo "meet-rec              alterna grabar/parar"
+    echo "meet-rec --status     estado actual"
+    echo "meet-rec --self-test  verifica el pipeline completo" ;;
+  toggle)
+    # Estado huerfano (ffmpeg murio solo): limpiar en vez de quedar trabado.
+    if [[ -f "$STATE" ]] && ! kill -0 "$(head -1 "$STATE")" 2>/dev/null; then
+      rm -f "$STATE"
+      notify "Grabacion anterior interrumpida" "arrancando una nueva"
+    fi
+    if [[ -f "$STATE" ]]; then stop; else start; fi ;;
+  *) die "opcion desconocida: $1" ;;
+esac
