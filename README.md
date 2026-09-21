@@ -50,6 +50,21 @@ meet-rec --self-test     # graba 4 s y corre el pipeline entero
 Atajo en Hyprland: `bind = SUPER SHIFT, R, exec, meet-rec`. En Omarchy (Lua):
 `o.bind("SUPER + SHIFT + R", "Grabar reunion", "meet-rec")`.
 
+## Widget de barra (Omarchy)
+
+Este repo tambien es un plugin de Omarchy: un indicador en la barra que muestra
+los minutos que llevas grabando y alterna grabar/parar con un clic. Util cuando
+la reunion se alarga y se te olvida que estabas grabando.
+
+```sh
+omarchy plugin add https://github.com/CristoSolar/resumeet --enable
+~/.config/omarchy/plugins/cristosolar.resumeet/install.sh   # binarios y agentes
+```
+
+El widget lee el estado del archivo que escribe `meet-rec`, asi que refleja
+tambien las grabaciones iniciadas por el atajo de teclado, y sobrevive a un
+reinicio del shell sin perder la cuenta.
+
 ## Agentes personalizados
 
 Un agente es un archivo `~/.config/resumeet/agents/<nombre>.md` cuyo contenido

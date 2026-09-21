@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "cristosolar.resumeet",
+  "name": "Resumeet",
+  "version": "1.0.0",
+  "author": "CristoSolar",
+  "license": "MIT",
+  "description": "Graba, transcribe y resume reuniones. Widget de barra con el tiempo grabado.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Resumeet",
+    "description": "Indicador de grabacion de reunion: minutos en curso, clic para iniciar o parar.",
+    "category": "Audio",
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}
