@@ -10,7 +10,7 @@ import qs.Ui
 // arranco por el atajo de teclado en vez del clic.
 BarWidget {
   id: root
-  moduleName: "cristosolar.resumeet"
+  moduleName: "io.github.cristosolar.resumeet"
 
   property int startedAt: 0
   property double now: 0

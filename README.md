@@ -56,14 +56,28 @@ Este repo tambien es un plugin de Omarchy: un indicador en la barra que muestra
 los minutos que llevas grabando y alterna grabar/parar con un clic. Util cuando
 la reunion se alarga y se te olvida que estabas grabando.
 
+![Widget de resumeet en la barra de Omarchy](preview.png)
+
 ```sh
 omarchy plugin add https://github.com/CristoSolar/resumeet --enable
-~/.config/omarchy/plugins/cristosolar.resumeet/install.sh   # binarios y agentes
+~/.config/omarchy/plugins/io.github.cristosolar.resumeet/install.sh   # binarios y agentes
 ```
 
 El widget lee el estado del archivo que escribe `meet-rec`, asi que refleja
 tambien las grabaciones iniciadas por el atajo de teclado, y sobrevive a un
 reinicio del shell sin perder la cuenta.
+
+Para desinstalar:
+
+```sh
+omarchy plugin remove io.github.cristosolar.resumeet
+rm -f ~/.local/bin/meet-rec ~/.local/bin/meet-merge
+```
+
+El plugin no escribe fuera de su propio directorio. Lo demas que crea resumeet
+queda donde lo pusiste: agentes en `~/.config/resumeet/agents/`, grabaciones en
+`~/Reuniones/`, modelos de whisper en `~/.local/share/whisper-models/`. Borralos
+a mano si tampoco los queres.
 
 ## Agentes personalizados
 
