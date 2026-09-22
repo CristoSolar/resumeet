@@ -10,9 +10,16 @@ LLM="${RESUMEET_LLM:-claude -p}"   # comando que lee prompt como argumento y tra
 LANG_STT="${RESUMEET_LANG:-es}"
 MODEL="${MEET_REC_MODEL:-$HOME/.local/share/whisper-models/ggml-large-v3-turbo.bin}"
 STATE="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/meet-rec.state"
-MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin"
+# Revisiones fijadas (inmutables) + sha256 del blob: el contenido no puede cambiar bajo nosotros.
+MODEL_REV="5359861c739e955e79d9a303bcbc70fb988958b1"
+MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/$MODEL_REV/ggml-large-v3-turbo.bin"
+MODEL_SHA256="1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69"
+MODEL_MAXBYTES=1624555275
 VAD_MODEL="${MEET_REC_VAD_MODEL:-$HOME/.local/share/whisper-models/ggml-silero-v5.1.2.bin}"
-VAD_URL="https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin"
+VAD_REV="9ffd54a1e1ee413ddf265af9913beaf518d1639b"
+VAD_URL="https://huggingface.co/ggml-org/whisper-vad/resolve/$VAD_REV/ggml-silero-v5.1.2.bin"
+VAD_SHA256="29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf"
+VAD_MAXBYTES=885098
 
 notify() { notify-send -a "meet-rec" "$1" "${2:-}"; }
 die() { echo "meet-rec: $1" >&2; notify "Error" "$1"; exit 1; }
@@ -25,19 +32,32 @@ whisper_bin() {
   return 1
 }
 
+# Descarga verificada: revision fijada, tamano acotado, corte por estancamiento
+# y sha256 comprobado ANTES de mover el archivo a su ruta final.
+fetch_model() {
+  local dest=$1 url=$2 sha=$3 maxbytes=$4 what=$5
+  local tmp="$dest.part"
+  mkdir -p "$(dirname "$dest")"
+  rm -f "$tmp"
+  curl -fL --proto '=https' --tlsv1.2 \
+       --connect-timeout 20 --speed-limit 10240 --speed-time 60 \
+       --max-filesize "$maxbytes" --retry 3 \
+       -o "$tmp" "$url" || { rm -f "$tmp"; die "no se pudo descargar $what"; }
+  local got
+  got=$(sha256sum "$tmp" | cut -d" " -f1)
+  [[ "$got" == "$sha" ]] || { rm -f "$tmp"; die "$what corrupto o alterado (sha256 $got != $sha)"; }
+  mv "$tmp" "$dest"
+}
+
 ensure_model() {
   [[ -f "$MODEL" ]] && return 0
   notify "Descargando modelo" "1.6 GB, solo la primera vez"
-  mkdir -p "$(dirname "$MODEL")"
-  curl -fL --retry 3 -o "$MODEL.part" "$MODEL_URL" || die "no se pudo descargar el modelo"
-  mv "$MODEL.part" "$MODEL"
+  fetch_model "$MODEL" "$MODEL_URL" "$MODEL_SHA256" "$MODEL_MAXBYTES" "el modelo"
 }
 
 ensure_vad_model() {
   [[ -f "$VAD_MODEL" ]] && return 0
-  mkdir -p "$(dirname "$VAD_MODEL")"
-  curl -fL --retry 3 -o "$VAD_MODEL.part" "$VAD_URL" || die "no se pudo descargar el modelo VAD"
-  mv "$VAD_MODEL.part" "$VAD_MODEL"
+  fetch_model "$VAD_MODEL" "$VAD_URL" "$VAD_SHA256" "$VAD_MAXBYTES" "el modelo VAD"
 }
 
 start() {
