@@ -2,17 +2,19 @@
   "schemaVersion": 1,
   "id": "io.github.cristosolar.resumeet",
   "name": "Resumeet",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "CristoSolar",
   "license": "MIT",
-  "description": "Graba, transcribe y resume reuniones. Widget de barra con el tiempo grabado.",
-  "kinds": ["bar-widget"],
+  "description": "Record, transcribe and summarize meetings, fully offline. A bar widget toggles recording and shows elapsed minutes. ffmpeg captures your mic and the system audio as two tracks, so you get speaker separation without diarization; whisper.cpp transcribes locally, and your own prompt files turn the transcript into a summary or next steps. A local viewer lists every meeting with its notes, transcript and audio. Only the prompt step calls an LLM, and you pick the command.",
+  "kinds": [
+    "bar-widget"
+  ],
   "entryPoints": {
     "barWidget": "BarWidget.qml"
   },
   "barWidget": {
     "displayName": "Resumeet",
-    "description": "Indicador de grabacion de reunion: minutos en curso, clic para iniciar o parar.",
+    "description": "Meeting recording indicator: elapsed minutes, click to start or stop.",
     "category": "Audio",
     "defaultSection": "right",
     "allowMultiple": false

@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+"""Resumeet: front local para revisar reuniones de meet-rec.
+
+Sirve ~/Reuniones en http://127.0.0.1:8765 — indice de reuniones,
+resumen, transcripcion y reproductores de audio por pista.
+Solo stdlib. Ctrl+C para parar.
+"""
+import html
+import os
+import re
+import sys
+from datetime import datetime
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
+from urllib.parse import unquote
+
+BASE = Path(os.environ.get("MEET_REC_DIR", Path.home() / "Reuniones"))
+PORT = int(os.environ.get("MEET_VIEW_PORT", "8765"))
+STATE = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "meet-rec.state"
+
+# ponytail: solo se sirven nombres con este patron; suficiente contra traversal
+SAFE = re.compile(r"^[\w.\-]+$")
+
+# ponytail: dos idiomas en un dict; i18n de verdad cuando haya un tercero
+LANG = "en" if (os.environ.get("RESUMEET_UI_LANG") or os.environ.get("RESUMEET_LANG", "es")).lower().startswith("en") else "es"
+T = {
+    "es": {
+        "meses": ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"],
+        "tagline": "notas &amp; audio de reuniones",
+        "meetings": "Reuniones", "recorded": "grabadas", "no_summary": "sin resumen",
+        "empty": "No hay reuniones todavia — SUPER+SHIFT+R para grabar",
+        "audio": "Audio", "summary": "Resumen", "actions": "Pasos a seguir",
+        "transcript": "Transcripcion", "full_transcript": "Transcripcion completa",
+        "mic": "Yo — microfono", "remote": "Ellos — remoto",
+        "no_audio": "sin pistas de audio", "missing": "no existe",
+        "back": "&larr; Todas las reuniones", "min": "min",
+    },
+    "en": {
+        "meses": ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"],
+        "tagline": "meeting notes &amp; audio",
+        "meetings": "Meetings", "recorded": "recorded", "no_summary": "no summary",
+        "empty": "No meetings yet — press SUPER+SHIFT+R to record",
+        "audio": "Audio", "summary": "Summary", "actions": "Next steps",
+        "transcript": "Transcript", "full_transcript": "Full transcript",
+        "mic": "Me — microphone", "remote": "Them — remote",
+        "no_audio": "no audio tracks", "missing": "not available",
+        "back": "&larr; All meetings", "min": "min",
+    },
+}[LANG]
+
+LOGO = """<svg class="logo" viewBox="0 0 32 32" aria-hidden="true">
+<rect width="32" height="32" fill="var(--ink)"/>
+<g stroke="var(--paper)" stroke-width="2.5" stroke-linecap="round">
+<line x1="8" y1="14" x2="8" y2="18"/><line x1="13" y1="10" x2="13" y2="22"/>
+<line x1="18" y1="7" x2="18" y2="25"/><line x1="24" y1="12" x2="24" y2="20"/>
+</g></svg>"""
+
+STYLE = """
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root{--ink:#f2f2f2;--paper:#0a0a0a;--grey:#9a9a9a;--line:#2b2b2b;color-scheme:dark}
+*{box-sizing:border-box}
+body{font:15px/1.6 "JetBrainsMono Nerd Font","JetBrains Mono",ui-monospace,monospace;
+     margin:0;color:var(--ink);background:var(--paper)}
+/* textura: grano de puntos sobre todo el fondo */
+body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;
+  background-image:radial-gradient(var(--ink) .5px,transparent .5px);
+  background-size:18px 18px;opacity:.05}
+main{position:relative;z-index:1;max-width:56rem;margin:0 auto;padding:0 1.5rem 5rem}
+header{display:flex;align-items:center;gap:.9rem;padding:2.2rem 0 1.4rem;
+  border-bottom:3px solid var(--ink)}
+.logo{width:44px;height:44px;flex:none}
+.brand{font-size:1.5rem;font-weight:700;letter-spacing:.28em;text-transform:uppercase}
+.brand small{display:block;font-size:.62rem;font-weight:400;letter-spacing:.14em;color:var(--grey)}
+.rec{margin-left:auto;font-size:.7rem;letter-spacing:.2em;border:1.5px solid var(--ink);
+  padding:.35rem .7rem;display:flex;align-items:center;gap:.5rem}
+.rec .dot{width:9px;height:9px;border-radius:50%;background:var(--ink);animation:blink 1.2s steps(2) infinite}
+@keyframes blink{50%{opacity:.15}}
+@media (prefers-reduced-motion:reduce){.rec .dot{animation:none}}
+h1{font-size:clamp(2.2rem,7vw,4rem);font-weight:700;letter-spacing:-.04em;
+   line-height:1.05;margin:2.4rem 0 .4rem}
+.sub{color:var(--grey);font-size:.8rem;letter-spacing:.18em;text-transform:uppercase;
+     margin:0 0 2.2rem}
+a{color:inherit}
+.back{display:inline-block;font-size:.78rem;letter-spacing:.15em;text-transform:uppercase;
+  text-decoration:none;border:1.5px solid var(--ink);padding:.45rem .9rem;margin-top:2rem;
+  transition:background .18s,color .18s}
+.back:hover,.back:focus-visible{background:var(--ink);color:var(--paper)}
+/* indice */
+.list{list-style:none;margin:0;padding:0}
+.list a{display:flex;align-items:baseline;gap:1.2rem;flex-wrap:wrap;
+  text-decoration:none;padding:1.15rem .9rem;border-bottom:1.5px solid var(--line);
+  transition:background .18s,color .18s;cursor:pointer}
+.list a:hover,.list a:focus-visible{background:var(--ink);color:var(--paper);outline:none}
+.list .fecha{font-size:1.25rem;font-weight:700;letter-spacing:-.02em}
+.list .hora{color:var(--grey)}.list a:hover .hora,.list a:hover .meta{color:inherit}
+.list .meta{margin-left:auto;font-size:.72rem;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--grey)}
+.tag{border:1px solid currentColor;padding:.1rem .5rem}
+/* seccion */
+h2{font-size:.8rem;font-weight:700;letter-spacing:.24em;text-transform:uppercase;
+   margin:3rem 0 1rem;display:flex;align-items:center;gap:.8rem}
+h2::after{content:"";flex:1;height:1px;background:var(--ink);opacity:.25}
+h2 .shape{width:10px;height:10px;background:var(--ink);flex:none}
+h2 .shape.o{border-radius:50%}
+h2 .shape.d{transform:rotate(45deg)}
+h2 .shape.t{clip-path:polygon(50% 0,100% 100%,0 100%)}
+audio{width:100%;margin:.4rem 0 1.1rem;display:block}
+.track{font-size:.72rem;letter-spacing:.14em;text-transform:uppercase;color:var(--grey)}
+/* documento: trama diagonal en el borde */
+.doc{border:1.5px solid var(--ink);padding:1.4rem 1.6rem;position:relative;background:var(--paper)}
+.doc::before{content:"";position:absolute;left:-1.5px;top:-1.5px;bottom:-1.5px;width:10px;
+  background:repeating-linear-gradient(45deg,var(--ink) 0 2px,transparent 2px 6px)}
+.doc h3{font-size:.78rem;letter-spacing:.2em;text-transform:uppercase;margin:1.6rem 0 .6rem;
+  padding-bottom:.3rem;border-bottom:1px solid var(--line)}
+.doc h3:first-child{margin-top:0}
+.doc h4{font-size:.74rem;letter-spacing:.15em;text-transform:uppercase;margin:1.2rem 0 .4rem;color:var(--grey)}
+.doc p{margin:.5rem 0}
+.doc ul{margin:.4rem 0;padding-left:1.3rem}
+.doc li{margin:.35rem 0}
+details{margin:1rem 0}
+summary{cursor:pointer;font-size:.78rem;letter-spacing:.15em;text-transform:uppercase;
+  border:1.5px solid var(--ink);padding:.6rem .9rem;list-style:none;user-select:none;
+  transition:background .18s,color .18s}
+summary:hover,summary:focus-visible{background:var(--ink);color:var(--paper)}
+summary::before{content:"+ "}details[open] summary::before{content:"\\2212 "}
+details .doc{border-top:none}
+.missing{color:var(--grey);font-style:italic}
+.empty{border:1.5px dashed var(--grey);padding:3rem;text-align:center;color:var(--grey);
+  letter-spacing:.1em;text-transform:uppercase;font-size:.8rem}
+footer{margin-top:4rem;padding-top:1rem;border-top:1.5px solid var(--line);
+  font-size:.68rem;letter-spacing:.14em;text-transform:uppercase;color:var(--grey);
+  display:flex;justify-content:space-between}
+:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
+</style>
+"""
+
+
+def rec_badge():
+    if STATE.is_file():
+        return '<span class="rec"><span class="dot"></span>REC</span>'
+    return ""
+
+
+def page(title, body):
+    return (
+        f"<title>{html.escape(title)} — Resumeet</title>{STYLE}<main>"
+        f'<header>{LOGO}<span class="brand">Resumeet<small>{T["tagline"]}</small></span>{rec_badge()}</header>'
+        f"{body}"
+        f'<footer><span>Resumeet</span><span>local · {html.escape(str(BASE))}</span></footer></main>'
+    ).encode()
+
+
+def fecha_larga(name):
+    try:
+        dt = datetime.strptime(name, "%Y-%m-%d_%H%M")
+        return f"{dt.day:02d} {T['meses'][dt.month - 1]} {dt.year}", f"{dt.hour:02d}:{dt.minute:02d}"
+    except ValueError:
+        return name, ""
+
+
+def titulo(d: Path) -> str:
+    try:
+        return (d / "titulo.txt").read_text(errors="replace").strip().splitlines()[0]
+    except (OSError, IndexError):
+        return ""
+
+
+def dur(d: Path) -> str:
+    # ponytail: duracion por tamano de archivo (16kHz mono s16 = 32000 B/s), sin parsear header
+    try:
+        secs = max(0, (d / "mic.wav").stat().st_size - 44) // 32000
+        return f"{secs // 60} {T['min']}" if secs >= 60 else f"{secs} s"
+    except OSError:
+        return ""
+
+
+def md_html(text: str) -> str:
+    # ponytail: markdown minimo (headers, bullets, negrita); suficiente para
+    # lo que emite meet-rec, sin libreria
+    out, in_list = [], False
+    for line in text.splitlines():
+        line = html.escape(line)
+        line = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", line)
+        if line.startswith("- "):
+            if not in_list:
+                out.append("<ul>")
+                in_list = True
+            out.append(f"<li>{line[2:]}</li>")
+            continue
+        if in_list:
+            out.append("</ul>")
+            in_list = False
+        if line.startswith("### "):
+            out.append(f"<h4>{line[4:]}</h4>")
+        elif line.startswith("## "):
+            out.append(f"<h3>{line[3:]}</h3>")
+        elif line.startswith("# "):
+            out.append(f"<h3>{line[2:]}</h3>")
+        elif line.strip():
+            out.append(f"<p>{line}</p>")
+    if in_list:
+        out.append("</ul>")
+    return "".join(out)
+
+
+def md_block(d: Path, name: str) -> str:
+    f = d / name
+    if not f.is_file():
+        return f'<p class="missing">{T["missing"]}</p>'
+    return f'<div class="doc">{md_html(f.read_text(errors="replace"))}</div>'
+
+
+class Handler(BaseHTTPRequestHandler):
+    def send(self, code, body, ctype="text/html; charset=utf-8", extra=()):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in extra:
+            self.send_header(k, v)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def do_HEAD(self):
+        self.do_GET()
+
+    def do_GET(self):
+        parts = [unquote(p) for p in self.path.strip("/").split("/") if p]
+        if any(not SAFE.match(p) for p in parts):
+            return self.send(400, b"nombre invalido", "text/plain")
+        try:
+            if not parts:
+                return self.index()
+            if parts[0] == "m" and len(parts) == 2:
+                return self.meeting(parts[1])
+            if parts[0] == "f" and len(parts) == 3:
+                return self.file(parts[1], parts[2])
+            self.send(404, b"no encontrado", "text/plain")
+        except BrokenPipeError:
+            pass  # el navegador corta los <audio> a medio stream; normal
+
+    def index(self):
+        dirs = sorted((d for d in BASE.iterdir() if d.is_dir()), reverse=True)
+        items = ""
+        for d in dirs:
+            fecha, hora = fecha_larga(d.name)
+            tag = "" if (d / "resumen.md").is_file() else f'<span class="tag">{T["no_summary"]}</span>'
+            t = titulo(d)
+            # Con titulo: el nombre manda y la fecha pasa a secundaria.
+            grande, chico = (html.escape(t), f"{fecha} {hora}") if t else (fecha, hora)
+            items += (
+                f'<li><a href="/m/{d.name}"><span class="fecha">{grande}</span>'
+                f'<span class="hora">{chico}</span>'
+                f'<span class="meta">{dur(d)} {tag}</span></a></li>'
+            )
+        body = f'<ul class="list">{items}</ul>' if items else f'<div class="empty">{T["empty"]}</div>'
+        self.send(200, page(T["meetings"], f'<h1>{T["meetings"]}</h1><p class="sub">{len(dirs)} {T["recorded"]}</p>{body}'))
+
+    def meeting(self, name):
+        d = BASE / name
+        if not d.is_dir():
+            return self.send(404, b"no encontrado", "text/plain")
+        fecha, hora = fecha_larga(name)
+        t = titulo(d)
+        nombre = t or fecha  # crudo para page(), que escapa el <title>
+        h1 = html.escape(nombre)
+        sub = f"{fecha} · {hora} · {dur(d)}" if t else f"{hora} · {dur(d)}"
+        audios = "".join(
+            f'<span class="track">{label}</span><audio controls preload="metadata" src="/f/{name}/{track}.wav"></audio>'
+            for label, track in ((T["mic"], "mic"), (T["remote"], "remoto"))
+            if (d / f"{track}.wav").is_file()
+        ) or f'<p class="missing">{T["no_audio"]}</p>'
+        body = (
+            f'<h1>{h1}</h1><p class="sub">{sub}</p>'
+            f'<h2><span class="shape o"></span>{T["audio"]}</h2>{audios}'
+            f'<h2><span class="shape"></span>{T["summary"]}</h2>{md_block(d, "resumen.md")}'
+            f'<h2><span class="shape t"></span>{T["actions"]}</h2>{md_block(d, "analisis.md")}'
+            f'<h2><span class="shape d"></span>{T["transcript"]}</h2>'
+            f'<details><summary>{T["full_transcript"]}</summary>{md_block(d, "transcripcion.md")}</details>'
+            f'<a class="back" href="/">{T["back"]}</a>'
+        )
+        self.send(200, page(nombre, body))
+
+    def file(self, name, fname):
+        f = BASE / name / fname
+        if not f.is_file():
+            return self.send(404, b"no encontrado", "text/plain")
+        ctype = "audio/wav" if fname.endswith(".wav") else "text/plain; charset=utf-8"
+        size = f.stat().st_size
+        # Range: los <audio> de Chromium/Vivaldi lo exigen para reproducir y buscar.
+        m = re.match(r"bytes=(\d*)-(\d*)$", self.headers.get("Range", ""))
+        if m and (m[1] or m[2]):
+            start = int(m[1]) if m[1] else max(0, size - int(m[2]))
+            end = min(int(m[2]), size - 1) if m[1] and m[2] else size - 1
+            if start >= size:
+                return self.send(416, b"", extra=[("Content-Range", f"bytes */{size}")])
+            with open(f, "rb") as fh:
+                fh.seek(start)
+                chunk = fh.read(end - start + 1)
+            return self.send(206, chunk, ctype, extra=[
+                ("Content-Range", f"bytes {start}-{end}/{size}"),
+                ("Accept-Ranges", "bytes"),
+            ])
+        self.send(200, f.read_bytes(), ctype, extra=[("Accept-Ranges", "bytes")])
+
+    def log_message(self, *a):
+        pass
+
+
+if __name__ == "__main__":
+    if "--check" in sys.argv:  # self-test sin red
+        assert b"Resumeet" in page(T["meetings"], "<ul></ul>")
+        assert not SAFE.match("../etc") and SAFE.match("2026-09-01_0938")
+        assert fecha_larga("2026-09-01_1308") == ("01 sep 2026", "13:08")  # sep es igual en ambos idiomas
+        assert re.match(r"bytes=(\d*)-(\d*)$", "bytes=0-")[1] == "0"
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "titulo.txt").write_text("Kickoff\nextra")
+            assert titulo(Path(td)) == "Kickoff" and titulo(Path(td) / "nada") == ""
+        print("OK")
+        sys.exit(0)
+    print(f"Resumeet en http://127.0.0.1:{PORT}  (Ctrl+C para parar)")
+    ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()

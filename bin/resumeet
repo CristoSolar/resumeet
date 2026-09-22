@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Resumeet: opens the meeting viewer as an app window.
+# Starts meet-view first if it is not already running.
+URL="http://127.0.0.1:${MEET_VIEW_PORT:-8765}"
+if ! curl -sf -o /dev/null --max-time 1 "$URL"; then
+  setsid -f meet-view >/dev/null 2>&1
+  for _ in $(seq 20); do
+    curl -sf -o /dev/null --max-time 1 "$URL" && break
+    sleep 0.25
+  done
+fi
+# ponytail: omarchy-launch-webapp gives a chromeless window; xdg-open is the fallback elsewhere
+if command -v omarchy-launch-webapp >/dev/null; then
+  exec omarchy-launch-webapp "$URL"
+fi
+exec xdg-open "$URL"
